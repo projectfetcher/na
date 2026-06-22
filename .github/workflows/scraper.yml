@@ -1,9 +1,10 @@
 name: Scraper
-
-# Manual trigger by default. Uncomment the schedule block below once you're
-# happy with the output and want it to run automatically.
+  
 on:
+  schedule:
+    - cron: "0 */3 * * *"
   workflow_dispatch:
+  
     inputs:
       pages:
         description: "Number of listing pages to scrape (each page ~ 10-15 companies)"
