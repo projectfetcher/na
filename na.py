@@ -1,3 +1,51 @@
+#!/usr/bin/env python3
+"""
+jobsnamibia.net scraper -> Mistral paraphrase -> WordPress posting.
+
+Secrets are read from environment variables (a local .env is auto-loaded if
+python-dotenv is installed):
+
+    WP_BASE_URL        e.g. https://jobs.dataaxisnode.com/na/wp-json/wp/v2
+    WP_USERNAME        WordPress username
+    WP_APP_PASSWORD    WordPress application password
+    MISTRAL_API_KEY    Mistral API key (paraphrasing; optional)
+
+Optional tuning vars:
+    REQUEST_DELAY      polite delay between requests, seconds (default 1.0)
+    MAX_JOBS           stop after N new jobs (0 = unlimited)
+    SCRAPE_PAGES       cap on number of listing/seed pages crawled (0 = all)
+    SCRAPE_REGIONS     "1" (default) also crawl per-region listing pages
+
+-----------------------------------------------------------------------------
+SITE STRUCTURE (re-verified June 2026 — the site was redesigned):
+
+  * The listing pages (/latest_jobs_in_namibia and the per-region
+    /<region>_vacancy pages) render each job as a CARD whose title is an
+    <h2> containing <a title="view vacancy details" href="/<region>/<slug>">.
+    The card also carries <h3>Company</h3>, <h3>Location</h3>, <h5>ClosingDate</h5>.
+    -> We collect the per-job DETAIL URLs from these cards.
+
+  * Each DETAIL page (/<region>/<slug>) holds the full job:
+      - <title> = job title; also an <h2><a href="#">Title</a></h2>
+      - <img alt="This is the company Logo"> = company logo
+        (the site logo is alt="Company Logo" / logo2023.webp — excluded)
+      - "Company Details" section with address/phone
+      - <h4>Experience</h4><h5>value</h5>, <h4>Job Type</h4><h5>value</h5>,
+        <h4>Closing Date</h4><h5>value</h5> field pairs
+      - the job body (h3 section headings + paragraphs + bullet lists)
+      - an "Apply online via: <a>...</a>" link OR an employer email
+      - trailing CV-services / interview-tips boilerplate (stripped)
+
+  * ?page=N currently re-serves page 1 (no real pagination), so coverage
+    comes from crawling the distinct per-region listing pages instead.
+
+Selectors deliberately key off STABLE LANDMARKS (link title attribute, image
+alt text, heading-label/value pairs, the <title> tag, boilerplate markers)
+rather than CSS class names — the old class-based selectors are exactly what
+broke in the redesign.
+-----------------------------------------------------------------------------
+"""
+
 import os
 import re
 import sys
@@ -41,19 +89,20 @@ except ImportError:
 
 BASE_URL = "https://www.jobsnamibia.net"
 
-# jobsnamibia.net's main feed is the paginated "Latest Vacancies" listing.
-# Page 1 is the bare path, subsequent pages use ?page=N (confirmed by the
-# "Page 1 [2] [Next Page >>]" pager seen on the live site).
+# The "Latest Vacancies" feed is the primary seed page.
 LISTING_PATH = "/latest_jobs_in_namibia"
 
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))  # polite delay between requests, seconds
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "0"))                # 0 = no cap, otherwise stop after N new jobs
 
-# How many listing pages to crawl. 0 or unset means "crawl page 1, then keep
-# going until a page returns no job cards" (auto-detect end of pagination).
-# A positive value caps the crawl at that many pages.
+# Cap on how many listing/seed pages to crawl. 0/unset = crawl all discovered
+# seed pages (latest page + per-region pages).
 _scrape_pages_raw = int(os.environ.get("SCRAPE_PAGES", "0"))
 SCRAPE_PAGES = _scrape_pages_raw if _scrape_pages_raw > 0 else None
+
+# Also crawl the per-region listing pages (windhoek_vacancy, swakopmund_vacancy,
+# international_vacancies, ...) for full coverage. On by default.
+SCRAPE_REGIONS = os.environ.get("SCRAPE_REGIONS", "1").strip().lower() not in ("0", "false", "no", "")
 
 OUTPUT_FILE = "jobsnamibia_jobs.xlsx"
 PROCESSED_IDS_FILE = "jobsnamibia_processed.csv"
@@ -107,6 +156,30 @@ REQUEST_TIMEOUT = 25
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
+# ── Landmarks used by the scraper (stable across class-name churn) ──────────
+SITE_HOST       = "jobsnamibia.net"
+JOB_LINK_TITLE  = "view vacancy details"            # title attr on every job card link
+DETAIL_META_LABELS = ("experience", "job type", "closing date", "salary")
+SOCIAL_HOST_RE  = re.compile(r"(facebook|instagram|twitter|linkedin|youtube|wa\.me|whatsapp|t\.me)", re.I)
+
+# Markers that signal the END of the real job body on a detail page (the CV
+# upsell / interview-tips / footer boilerplate).
+DESC_STOP_RE = re.compile(
+    r"(need help drafting|our services and their price|get our cv package|"
+    r"^\s*contact details\b|^\s*interview tips\b|checkout our|online job posting service|"
+    r"love what we do|^\s*top links\b|^\s*advertisement\b|all rights? reserved|"
+    r"another site by|forward your job advert|browser our price rates)",
+    re.I,
+)
+
+# Headings used as a FALLBACK start of the body when the metadata block is
+# missing (primary anchor is "after the last metadata field").
+DESC_START_HINTS = (
+    "purpose of the job", "job description", "job summary", "about the role",
+    "about the job", "responsibilities", "duties", "key performance",
+    "main purpose", "overview", "requirements",
+)
+
 # =============================================================================
 #  LOGGING / COLOUR
 # =============================================================================
@@ -145,11 +218,6 @@ BOILERPLATE_PATTERNS = [
     re.compile(r"INTERVIEW TIPS:.*$", re.I | re.S),
     re.compile(r"Checkout our.*CV Layout.*$", re.I),
 ]
-
-# Section headers used on jobsnamibia.net job-detail pages. Several of these
-# show up as their own h3/h4 blocks above a short value (Experience, Job Type,
-# Closing Date) and are extracted as key/value pairs rather than free text.
-KEY_VALUE_HEADERS = ("experience", "job type", "closing date", "salary", "location")
 
 # =============================================================================
 #  TEXT CLEANUP / SANITIZATION
@@ -229,6 +297,15 @@ def extract_email(text):
     m = EMAIL_PATTERN.search(text)
     return m.group(0) if m else ""
 
+def first_external_email(text):
+    """First email in text that is NOT a jobsnamibia.net address (the site's
+    own CV-help/advert addresses must never be treated as an apply email)."""
+    for m in EMAIL_PATTERN.finditer(text or ""):
+        e = m.group(0)
+        if SITE_HOST not in e.lower():
+            return e
+    return ""
+
 def region_from_url(job_url):
     """jobsnamibia.net job URLs look like /windhoek/Job-Slug or
     /walvis-bay/Job-Slug — the first path segment is a usable region hint."""
@@ -261,12 +338,11 @@ def is_placeholder_logo(url: str) -> bool:
 
 def extract_company_logo(soup: BeautifulSoup) -> str:
     """
-    Best-effort company logo lookup for a jobsnamibia.net job-detail page.
-    The site embeds a per-job company logo image right above/near the job
-    title (alt text observed as "This is the company Logo"), distinct from
-    the global site logo ("logo2023.webp") which we explicitly exclude.
-    Priority: og:image meta tag > <img alt*="company logo"> > any <img>
-    whose alt/src mentions "logo" and isn't the site logo placeholder.
+    Best-effort company logo lookup. The per-job logo image carries
+    alt="This is the company Logo" (distinct from the global site logo,
+    alt="Company Logo" / logo2023.webp, which we exclude). Priority:
+    og:image meta > exact "this is the company logo" alt > any "company logo"
+    alt that isn't the site-logo placeholder.
     """
     og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og:
@@ -276,22 +352,16 @@ def extract_company_logo(soup: BeautifulSoup) -> str:
             if cand and not is_placeholder_logo(cand):
                 return cand
 
-    for img in soup.find_all("img"):
-        alt = img.get("alt", "") or ""
-        if "company logo" in alt.lower():
-            cand = clean_logo_url(img.get("src") or img.get("data-src") or "")
-            if cand and not is_placeholder_logo(cand):
-                return cand
+    img = soup.find("img", alt=lambda v: bool(v) and "this is the company logo" in v.lower())
+    if img:
+        cand = clean_logo_url(img.get("src") or img.get("data-src") or "")
+        if cand and not is_placeholder_logo(cand):
+            return cand
 
-    for img in soup.find_all("img"):
-        blob = " ".join(filter(None, [
-            " ".join(img.get("class", []) or []),
-            img.get("id", ""), img.get("alt", ""), img.get("src", ""),
-        ]))
-        if LOGO_KEYWORDS_RE.search(blob):
-            cand = clean_logo_url(img.get("src") or img.get("data-src") or "")
-            if cand and not is_placeholder_logo(cand):
-                return cand
+    for img in soup.find_all("img", alt=lambda v: bool(v) and "company logo" in v.lower()):
+        cand = clean_logo_url(img.get("src") or img.get("data-src") or "")
+        if cand and not is_placeholder_logo(cand):
+            return cand
 
     return ""
 
@@ -636,14 +706,14 @@ def _upsert_row(job_id: str, updates: dict):
     df.to_csv(PROCESSED_IDS_FILE, index=False)
 
 def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
-    # jobsnamibia.net has no real per-job URL (multiple job cards share the
-    # same listing page URL), so title+company is the primary key here.
-    # job_url is kept as a last-resort fallback only.
+    # The redesigned site DOES expose a unique per-job detail URL
+    # (/<region>/<slug>), so that is the stable primary key. title+company
+    # is kept only as a fallback when a URL is somehow unavailable.
+    if job_url:
+        return hashlib.md5(job_url.encode()).hexdigest()[:16]
     if title or company:
         seed = f"{title}|{company}"
         return hashlib.md5(seed.encode()).hexdigest()[:16]
-    if job_url:
-        return hashlib.md5(job_url.encode()).hexdigest()[:16]
     return hashlib.md5(b"unknown").hexdigest()[:16]
 
 def mark_scraped(job_id, job_url, title, company):
@@ -795,171 +865,403 @@ def post_job_to_wordpress(job: dict) -> tuple:
     return None, None
 
 # =============================================================================
-#  STEP 1 — COLLECT LISTING PAGE URLS
-# =============================================================================
-#
-# IMPORTANT: jobsnamibia.net's "Latest Vacancies" feed is NOT a two-step
-# crawl (listing page -> separate job-detail page) the way MyJobMag is.
-# Each job card in the feed (div.index_latest_jobs) already contains the
-# full job content — title, company, location, experience, job type,
-# closing date, company details, and the full description. The card's own
-# title link is a dead `href="#"` anchor, so there is no usable per-job
-# detail URL to follow. We therefore parse jobs directly out of each
-# listing page (see STEP 2) instead of fetching a second page per job.
-
-def _listing_page_url(page_num: int) -> str:
-    if page_num <= 1:
-        return BASE_URL + LISTING_PATH
-    return f"{BASE_URL}{LISTING_PATH}?page={page_num}"
-
-def collect_listing_page_urls(pages=SCRAPE_PAGES):
-    """Builds the list of listing-page URLs to crawl. If `pages` is None,
-    this just seeds page 1 — collect_and_parse_jobs() below will keep
-    requesting subsequent pages on its own until a page yields zero job
-    cards (auto-detecting the end of pagination)."""
-    if pages:
-        return [_listing_page_url(i) for i in range(1, pages + 1)]
-    return [_listing_page_url(1)]
-
-# =============================================================================
-#  STEP 2 — PARSE JOB CARDS OUT OF A LISTING PAGE
+#  STEP 1 — DISCOVER LISTING / SEED PAGES
 # =============================================================================
 
-def _card_kv_fields(card):
-    """Reads the Experience / Job Type / Closing Date / Salary mini-fields
-    rendered as <div class="index_jobs_details"><h4>Label</h4><hr><h5>Value</h5></div>
-    blocks inside a job card's .index_more_details container."""
-    fields = {}
-    for kv in card.select(".index_more_details .index_jobs_details"):
-        h4 = kv.find("h4")
-        h5 = kv.find("h5")
-        label = clean_text(h4).lower().rstrip(":").strip() if h4 else ""
-        value = clean_text(h5) if h5 else ""
-        if label:
-            fields[label] = value
-    return fields
+def _is_job_detail_url(href: str) -> bool:
+    """True if href is a jobsnamibia per-job DETAIL page, i.e. a two-segment
+    path /<region>/<slug> (not a /category/.. , /company/.. , single-segment
+    listing page, or a static asset)."""
+    if not href:
+        return False
+    try:
+        p = urlparse(href)
+    except Exception:
+        return False
+    host = p.netloc.lower()
+    if host and SITE_HOST not in host:
+        return False
+    segs = [s for s in p.path.split("/") if s]
+    if len(segs) != 2:
+        return False
+    first, second = segs[0].lower(), segs[1].lower()
+    if first in ("category", "company", "documents", "images", "css", "js", "assets", "static"):
+        return False
+    if second.endswith((".pdf", ".webp", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js")):
+        return False
+    return True
 
-def _card_description(card):
-    """Pulls the full free-text job body from a card's .job_description
-    block, stripping the boilerplate phrases that sometimes leak in
-    (e.g. 'Go to method of application »')."""
-    desc_el = card.select_one(".job_description")
-    if desc_el is None:
-        return ""
-    return clean_description(clean_text(desc_el))
+def _is_region_listing_url(href: str) -> bool:
+    """True for single-segment region/listing pages like /windhoek_vacancy,
+    /swakopmund_vacancy, /international_vacancies."""
+    try:
+        p = urlparse(href)
+    except Exception:
+        return False
+    if p.netloc and SITE_HOST not in p.netloc.lower():
+        return False
+    segs = [s for s in p.path.split("/") if s]
+    if len(segs) != 1:
+        return False
+    seg = segs[0].lower()
+    return seg.endswith("_vacancy") or seg.endswith("_vacancies")
 
-def _card_company_and_location(card):
-    """The .latest_content block holds, in order: an <h2><a>Title</a></h2>,
-    then one or more <p> tags — the first is the company name, the next is
-    usually the location (often prefixed by a map-marker icon)."""
-    ps = card.select(".latest_content p")
-    company = clean_text(ps[0]) if ps else ""
-    location = clean_text(ps[1]) if len(ps) > 1 else ""
-    return company, location
+def collect_seed_urls():
+    """The latest-vacancies page plus (optionally) every per-region listing
+    page discovered from its sidebar. ?page=N currently re-serves page 1, so
+    coverage comes from these distinct listing pages."""
+    latest = BASE_URL + LISTING_PATH
+    seeds = [latest]
+    if not SCRAPE_REGIONS:
+        return seeds
+    try:
+        soup = get_soup(latest)
+    except Exception as e:
+        log(C_RED(f"  Could not load latest page to discover regions: {e}"))
+        return seeds
+    for a in soup.find_all("a", href=True):
+        href = absolute_url(a["href"])
+        if _is_region_listing_url(href) and href not in seeds:
+            seeds.append(href)
+    return seeds
 
-def parse_listing_page(url):
-    """Returns the list of job dicts found on one jobsnamibia.net listing
-    page by reading each div.index_latest_jobs card directly (see the note
-    at the top of STEP 1 for why there's no separate detail-page fetch)."""
+# =============================================================================
+#  STEP 2 — PARSE LISTING CARDS  (collect per-job DETAIL URLs + stub fields)
+# =============================================================================
 
-    soup = get_soup(url)
-    cards = soup.select("div.index_latest_jobs")
+def parse_listing_cards(soup, page_url=""):
+    """Each job card's title is an <h2> wrapping <a title="view vacancy
+    details" href="/<region>/<slug>">. Company / location / closing-date are
+    the <h3>/<h3>/<h5> immediately after that title (up to the next card).
+    Returns one stub dict per unique job."""
+    stubs = []
+    seen_local = set()
 
-    jobs = []
-    for card in cards:
-        title_a = card.select_one(".latest_content h2 a") or card.select_one(".latest_content h2")
-        title = clean_text(title_a)
-        if not title:
+    title_anchors = [
+        a for a in soup.find_all("a", attrs={"title": JOB_LINK_TITLE})
+        if a.find_parent("h2") is not None
+    ]
+
+    seen_h2 = []
+    for a in title_anchors:
+        h2 = a.find_parent("h2")
+        if any(h2 is x for x in seen_h2):
+            continue
+        seen_h2.append(h2)
+
+        url = absolute_url(a.get("href", ""))
+        if not _is_job_detail_url(url) or url in seen_local:
+            continue
+        seen_local.add(url)
+
+        title = clean_text(h2)
+
+        # Walk forward to the next card's <h2>, picking up this card's h3/h5.
+        h3_vals, date_val = [], ""
+        for nxt in h2.find_all_next():
+            if getattr(nxt, "name", None) == "h2" and nxt is not h2:
+                break
+            name = getattr(nxt, "name", None)
+            if name == "h3":
+                t = clean_text(nxt)
+                if t:
+                    h3_vals.append(t)
+            elif name == "h5" and not date_val:
+                date_val = clean_text(nxt)
+
+        company  = h3_vals[0] if h3_vals else ""
+        location = h3_vals[1] if len(h3_vals) > 1 else region_from_url(url)
+
+        stubs.append({
+            "title":        title,
+            "job_url":      url,
+            "company_name": company,
+            "location":     location,
+            "deadline":     date_val,
+            "source_page":  page_url,
+        })
+
+    return stubs
+
+def collect_job_stubs():
+    """Crawl every seed page and return de-duplicated job stubs, plus the list
+    of seed pages actually crawled."""
+    seeds = collect_seed_urls()
+    if SCRAPE_PAGES:
+        seeds = seeds[:SCRAPE_PAGES]
+
+    log(f"\n  Listing/seed pages to crawl: {len(seeds)}")
+    for s in seeds:
+        log(f"    • {s}")
+
+    all_stubs = {}
+    crawled   = []
+    prev_url_set = None
+
+    for idx, seed in enumerate(seeds, 1):
+        log(f"\n{'=' * 80}\nLISTING PAGE {idx}/{len(seeds)}: {seed}\n{'=' * 80}")
+        try:
+            soup = get_soup(seed)
+        except Exception as e:
+            log(C_RED(f"  ✗ failed to fetch listing: {e}"))
             continue
 
-        company_name, location = _card_company_and_location(card)
+        crawled.append(seed)
+        stubs   = parse_listing_cards(soup, seed)
+        url_set = {s["job_url"] for s in stubs}
+        log(f"  Found {len(stubs)} job card(s)")
 
-        kv = _card_kv_fields(card)
-        job_type   = kv.get("job type", "")
-        experience = kv.get("experience", "")
-        deadline   = kv.get("closing date", "")
-        salary     = kv.get("salary", "")
-
-        description = _card_description(card)
-
-        # Applications on jobsnamibia.net are email-based; look in the
-        # company-details block first (most reliable), then fall back to
-        # scanning the description.
-        company_details_el = card.select_one(".latest_company_details")
-        company_details_text = clean_text(company_details_el) if company_details_el else ""
-        apply_email = extract_email(company_details_text) or extract_email(description)
-
-        company_logo = clean_logo_url(
-            (card.select_one("img[alt='This is the company Logo']") or {}).get("src", "")
-            if card.select_one("img[alt='This is the company Logo']") else ""
-        )
-        if is_placeholder_logo(company_logo):
-            company_logo = ""
-
-        job = {
-            "title": title,
-            "job_url": url,           # no real per-job URL on this site; use the listing page
-            "job_type": job_type,
-            "qualification": "",       # not exposed as its own field on this site
-            "experience": experience,
-            "location": location,
-            "city": location,
-            "field": "",                # category taxonomy lives on separate /category/ pages, not per-job
-            "posted_date": "",          # jobsnamibia.net doesn't expose a separate "posted" date
-            "deadline": deadline,
-            "description": description,
-            "apply_url": "",            # applications are email-based, not redirect links
-            "apply_email": apply_email,
-            "apply_raw": "",
-            "company_name": company_name,
-            "company_url": "",          # no dedicated company profile page per job on this site
-            "company_blurb": "",        # no separate company-blurb section distinct from the job body
-            "company_logo": company_logo,
-            "salary": salary,
-            "source_page": url,
-        }
-        jobs.append(job)
-
-    return jobs
-
-def collect_and_parse_jobs(pages=SCRAPE_PAGES):
-    """Crawls listing page(s) and returns (all_raw_jobs, pages_visited).
-    If `pages` is falsy, keeps requesting page 2, 3, ... until a page
-    yields zero job cards, then stops (auto-detecting pagination end)."""
-    all_jobs = []
-    visited = []
-    i = 1
-    while True:
-        page_url = _listing_page_url(i)
-        log(f"\n{'=' * 80}\nFETCHING LISTING PAGE {i}: {page_url}\n{'=' * 80}")
-
-        try:
-            page_jobs = parse_listing_page(page_url)
-        except Exception as e:
-            log(f"  ERROR fetching/parsing listing page {i}: {e}")
+        # Safety net: if a page returns the exact same jobs as the previous one
+        # (e.g. a ?page wrap), stop rather than loop.
+        if prev_url_set is not None and url_set and url_set == prev_url_set:
+            log("  Same jobs as previous page — stopping.")
             break
+        prev_url_set = url_set
 
-        visited.append(page_url)
-        log(f"  Found {len(page_jobs)} job card(s) on this page")
-        all_jobs.extend(page_jobs)
+        for st in stubs:
+            all_stubs.setdefault(st["job_url"], st)
 
-        if pages:
-            if i >= pages:
-                break
-        else:
-            if len(page_jobs) == 0:
-                log("  No job cards found — assuming end of pagination, stopping.")
-                break
-
-        i += 1
         time.sleep(REQUEST_DELAY)
 
-    log(f"\nTotal job cards collected across {len(visited)} page(s): {len(all_jobs)}")
-    return all_jobs, visited
+    return list(all_stubs.values()), crawled
 
 # =============================================================================
-#  STEP 3 — DEDUPLICATE + PARAPHRASE  (turns a raw scraped job into the
-#           standardized, WordPress-ready / Excel-ready job dict)
+#  STEP 3 — PARSE A JOB DETAIL PAGE
+# =============================================================================
+
+def _detail_title(soup, stub_title=""):
+    if stub_title:
+        return stub_title
+    if soup.title:
+        t = re.split(r"\s*\|\|", soup.title.get_text(strip=True))[0].strip()
+        if t and t.lower() not in ("a website for all vacancies in namibia",
+                                   "latest vacancies in namibia"):
+            return t
+    h2 = soup.find("h2")
+    return clean_text(h2) if h2 else ""
+
+def _detail_meta_fields(soup):
+    """Experience / Job Type / Closing Date / Salary rendered as
+    <h4>Label</h4> ... <h5>Value</h5> pairs."""
+    out = {}
+    for h4 in soup.find_all("h4"):
+        label = clean_text(h4).lower().rstrip(":").strip()
+        if label in DETAIL_META_LABELS:
+            h5 = h4.find_next("h5")
+            if h5 is not None:
+                out[label] = clean_text(h5)
+    return out
+
+def _metadata_anchor(soup):
+    """The <h5> value of the LAST metadata label — the job body begins after
+    it. Returns None if no metadata block is present."""
+    anchor = None
+    for h4 in soup.find_all("h4"):
+        label = clean_text(h4).lower().rstrip(":").strip()
+        if label in DETAIL_META_LABELS:
+            h5 = h4.find_next("h5")
+            if h5 is not None:
+                anchor = h5
+    return anchor
+
+def _detail_company_address(soup):
+    """Address lines under the 'Company Details' heading (before the metadata
+    block). Phone lines are skipped."""
+    cd = None
+    for h in soup.find_all(["h3", "h4"]):
+        if clean_text(h).lower().rstrip(":").strip() == "company details":
+            cd = h
+            break
+    if cd is None:
+        return ""
+    lines = []
+    for nxt in cd.find_all_next():
+        name = getattr(nxt, "name", None)
+        if name in ("h3", "h4"):
+            lbl = clean_text(nxt).lower().rstrip(":").strip()
+            if lbl in DETAIL_META_LABELS:
+                break
+        if name in ("p", "h6"):
+            t = clean_text(nxt)
+            if t and not re.match(r"(?i)^(tel|phone|cell)\b", t) and "@" not in t:
+                lines.append(t)
+        if len(lines) >= 4:
+            break
+    # de-dup while preserving order
+    return ", ".join(dict.fromkeys(lines)).strip(", ")
+
+def _clean_detail_description(text):
+    """Strip trailing boilerplate while PRESERVING line breaks (so the body
+    keeps its paragraph/bullet structure for paraphrasing & WP rendering)."""
+    if not text:
+        return ""
+    for pattern in BOILERPLATE_PATTERNS:
+        text = pattern.sub("", text)
+    out = []
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(r"(?i)^closing date\s*:", s):          # redundant trailing echo
+            continue
+        out.append(re.sub(r"[ \t]+", " ", s))
+    return "\n".join(out).strip()
+
+def _detail_description(soup):
+    start_el = _metadata_anchor(soup)
+    if start_el is None:
+        for h in soup.find_all(["h2", "h3", "h4"]):
+            t = clean_text(h).lower()
+            if any(k in t for k in DESC_START_HINTS):
+                start_el = h
+                break
+    if start_el is None:
+        return ""
+
+    parts, seen = [], set()
+    for el in start_el.find_all_next(["h2", "h3", "h4", "h5", "h6", "p", "li"]):
+        txt = clean_text(el)
+        if not txt:
+            continue
+        if DESC_STOP_RE.search(txt):
+            break
+        key = (el.name, txt)
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(("- " + txt) if el.name == "li" else txt)
+
+    return _clean_detail_description("\n".join(parts))
+
+def _detail_application(soup):
+    """An external apply URL and/or a non-jobsnamibia email found within the
+    job body (between the metadata block and the boilerplate)."""
+    start_el = _metadata_anchor(soup)
+    scope_iter = (start_el.find_all_next(["a", "h2", "h3", "h4", "p", "li"])
+                  if start_el is not None else soup.find_all("a"))
+
+    apply_url, apply_email = "", ""
+    for el in scope_iter:
+        name = getattr(el, "name", None)
+        txt = clean_text(el)
+        if start_el is not None and txt and DESC_STOP_RE.search(txt):
+            break
+        if name != "a":
+            continue
+        href = (el.get("href") or "").strip()
+        if not href:
+            continue
+        low = href.lower()
+        if low.startswith("mailto:"):
+            email = re.split(r"[?\s]", href.split(":", 1)[1])[0].strip()
+            if email and SITE_HOST not in email.lower() and not apply_email:
+                apply_email = email
+            continue
+        if low.startswith(("tel:", "sms:", "#", "javascript:")):
+            continue
+        if low.startswith("http") or low.startswith("/"):
+            full = absolute_url(href) if low.startswith("/") else href
+            host = urlparse(full).netloc.lower()
+            if SITE_HOST in host or SOCIAL_HOST_RE.search(host):
+                continue
+            if not apply_url:
+                apply_url = full
+
+    return apply_url, apply_email
+
+def parse_detail_soup(soup, stub):
+    """Turn a fetched detail-page soup + its listing stub into a raw_job dict
+    (the shape process_job() expects)."""
+    url = stub.get("job_url", "")
+
+    title      = _detail_title(soup, stub.get("title", ""))
+    meta       = _detail_meta_fields(soup)
+    job_type   = meta.get("job type", "")
+    experience = meta.get("experience", "")
+    salary     = meta.get("salary", "")
+    deadline   = meta.get("closing date", "") or stub.get("deadline", "")
+
+    description = _detail_description(soup)
+
+    apply_url, apply_email = _detail_application(soup)
+    if not apply_email:
+        apply_email = first_external_email(description)
+
+    logo = ""
+    logo_img = soup.find("img", alt=lambda v: bool(v) and "this is the company logo" in v.lower())
+    if logo_img:
+        logo = clean_logo_url(logo_img.get("src") or logo_img.get("data-src") or "")
+        if is_placeholder_logo(logo):
+            logo = ""
+    if not logo:
+        logo = extract_company_logo(soup)
+
+    company  = stub.get("company_name", "") or ""
+    location = stub.get("location", "") or region_from_url(url)
+    address  = _detail_company_address(soup) or location
+
+    return {
+        "title":          title,
+        "job_url":        url,
+        "job_type":       job_type,
+        "qualification":  "",
+        "experience":     experience,
+        "location":       location,
+        "city":           location,
+        "field":          "",
+        "posted_date":    "",
+        "deadline":       deadline,
+        "description":    description,
+        "apply_url":      apply_url,
+        "apply_email":    apply_email,
+        "apply_raw":      "",
+        "company_name":   company,
+        "company_url":    "",
+        "company_blurb":  "",
+        "company_logo":   logo,
+        "company_address": address,
+        "salary":         salary,
+        "source_page":    stub.get("source_page", ""),
+    }
+
+def parse_detail_page(stub):
+    url = stub.get("job_url", "")
+    try:
+        soup = get_soup(url)
+    except Exception as e:
+        log(C_RED(f"    ✗ detail fetch failed: {url} ({e})"))
+        return None
+    return parse_detail_soup(soup, stub)
+
+def collect_and_parse_jobs(known_ids=None, known_urls=None):
+    """Collect job stubs from listing pages, then fetch & parse each detail
+    page. Detail pages for jobs already in the tracker are skipped (politeness
+    + speed). Returns (raw_jobs, seed_pages)."""
+    known_ids  = known_ids  or set()
+    known_urls = known_urls or set()
+
+    stubs, seeds = collect_job_stubs()
+    log(f"\n  Total unique job links collected: {len(stubs)}")
+
+    raw_jobs = []
+    for i, stub in enumerate(stubs, 1):
+        url = stub["job_url"]
+        if url in known_urls or make_job_id(url) in known_ids:
+            log(C_DIM(f"  ⧳ [{i}/{len(stubs)}] already in tracker — skipped: {url}"))
+            continue
+
+        log(C_DIM(f"  → [{i}/{len(stubs)}] detail: {url}"))
+        raw = parse_detail_page(stub)
+        if raw is not None and (raw.get("title") or raw.get("description")):
+            raw_jobs.append(raw)
+        else:
+            log(C_RED(f"    ✗ no usable content parsed: {url}"))
+        time.sleep(REQUEST_DELAY)
+
+    return raw_jobs, seeds
+
+# =============================================================================
+#  STEP 4 — DEDUPLICATE + PARAPHRASE
 # =============================================================================
 
 def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_content: set):
@@ -969,9 +1271,9 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     standardized job dict ready for WordPress posting / Excel export.
     Returns None if the job was a duplicate (and should be skipped).
     """
-    job_url = raw_job.get("job_url", "")
-    title   = raw_job.get("title", "")
-    company = raw_job.get("company_name", "")
+    job_url  = raw_job.get("job_url", "")
+    title    = raw_job.get("title", "")
+    company  = raw_job.get("company_name", "")
     location = raw_job.get("location") or raw_job.get("city", "")
 
     job_id = make_job_id(job_url, title, company)
@@ -1011,9 +1313,10 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     apply_email = raw_job.get("apply_email", "")
     application = apply_url or apply_email
 
-    company_website = ""  # jobsnamibia.net applications are email-based; no employer domain to derive
+    company_website = ""  # jobsnamibia.net does not expose a distinct employer domain
 
-    apply_method = "resolved_redirect" if apply_url else ("description_email" if apply_email else "not_found")
+    apply_method = ("resolved_redirect" if apply_url
+                    else ("description_email" if apply_email else "not_found"))
 
     return {
         # Paraphrased fields
@@ -1036,7 +1339,7 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
         "companyName":       company,
         "companyLogo":       raw_job.get("company_logo", ""),
         "companyWebsite":    company_website,
-        "companyAddress":    raw_job.get("city", ""),
+        "companyAddress":    raw_job.get("company_address") or raw_job.get("city", ""),
         "jobUrl":            job_url,
         "salaryRange":       raw_job.get("salary", ""),
         "_jobId":            job_id,
@@ -1078,6 +1381,7 @@ def print_job_verbose(index, job):
     print(f"  {C_LABEL('Name')}      : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
     print(f"  {C_LABEL('Page')}      : {job.get('companyUrl','') or C_DIM('—')}")
     print(f"  {C_LABEL('Website')}   : {job.get('companyWebsite','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Address')}   : {job.get('companyAddress','') or C_DIM('—')}")
     print(f"  {C_LABEL('Logo')}      : {job.get('companyLogo','') or C_DIM('— none —')}")
     about = job.get("companyDetails", "")
     if about:
@@ -1134,7 +1438,8 @@ def main():
     print(C_HEADER("=" * 80))
     print(C_HEADER("  JOBSNAMIBIA.NET SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
     print(C_HEADER("=" * 80))
-    print(f"  Scrape pages    : {SCRAPE_PAGES}")
+    print(f"  Seed-page cap   : {SCRAPE_PAGES if SCRAPE_PAGES else 'all'}")
+    print(f"  Crawl regions   : {'✅' if SCRAPE_REGIONS else '❌'}")
     print(f"  Request delay   : {REQUEST_DELAY}s")
     print(f"  Max new jobs    : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
     print(f"  Paraphrase      : {'✅ enabled' if (ENABLE_PARAPHRASE and MISTRAL_API_KEY) else '❌ disabled'}")
@@ -1148,7 +1453,7 @@ def main():
     processed_ids, processed_urls = load_processed_ids()
     print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
 
-    raw_jobs, page_urls = collect_and_parse_jobs(SCRAPE_PAGES)
+    raw_jobs, page_urls = collect_and_parse_jobs(processed_ids, processed_urls)
 
     jobs_out = []
     seen_content = set()
@@ -1196,7 +1501,7 @@ def main():
     print(C_HEADER("=" * 80))
     print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 80))
-    print(f"  {C_LABEL('Job pages visited')}          : {len(page_urls)}")
+    print(f"  {C_LABEL('Listing pages visited')}      : {len(page_urls)}")
     print(f"  {C_LABEL('Raw jobs found')}             : {total_raw_jobs}")
     print(f"  {C_LABEL('New jobs processed')}         : {C_GREEN(str(len(jobs_out)))}")
     print(f"  {C_LABEL('Posted to WordPress')}        : {C_GREEN(str(posted_count))}")
