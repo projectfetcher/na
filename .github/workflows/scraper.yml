@@ -68,8 +68,8 @@ jobs:
         with:
           name: myjobmag-sa-output-${{ github.run_number }}
           path: |
-            myjobmag_sa_jobs.xlsx
-            myjobmag_sa_processed.csv
+            jobsnamibia_processed.xlsx
+            jobsnamibia_processed.csv
           if-no-files-found: warn
 
       - name: Commit updated dedup tracker back to repo
@@ -77,6 +77,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add myjobmag_sa_processed.csv
+          git add jobsnamibia_processed.csv
           git diff --cached --quiet || git commit -m "Update MyJobMag SA dedup tracker [skip ci]"
           git push
