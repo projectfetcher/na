@@ -736,7 +736,7 @@ def mark_failed(job_id, reason):
 
 def _wp_auth_headers() -> dict:
     token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
-    h = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    h = {"Authorization": f"Basic {token}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
     if INTERNAL_BOT_KEY:
         h["X-Internal-Auth"] = INTERNAL_BOT_KEY
     return h
